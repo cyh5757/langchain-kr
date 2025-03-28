@@ -1,42 +1,46 @@
-# API KEY를 환경변수로 관리하기 위한 설정 파일
-from dotenv import load_dotenv
-from langchain_teddynote import logging
-import pandas as pd
-from datasets import load_dataset, Dataset
-from langsmith import Client
 import os
+from dotenv import load_dotenv
+import pandas as pd
+from datasets import load_dataset
+from langsmith import Client
+from langchain_teddynote import logging
 
-
-
+# 1. 환경변수 및 로깅 설정
 load_dotenv()
 logging.langsmith("HF2langsmith")
 
-
-# huggingface Dataset에서 repo_id로 데이터셋 다운로드
+# 2. HuggingFace 데이터셋 로드
 dataset = load_dataset(
-    "meto/ragas-test-dataset",  # 데이터셋 이름
-    token=os.environ["HUGGINGFACEHUB_API_TOKEN"],  # private 데이터인 경우 필요합니다.
+    "meto/ragas-test-dataset",
+    token=os.environ.get("HUGGINGFACEHUB_API_TOKEN")
 )
 
-# 데이터셋에서 split 기준으로 조회
 huggingface_df = dataset["korean_v1"].to_pandas()
 
+# 3. LangSmith 클라이언트 설정
 client = Client()
 dataset_name = "RAG_EVAL_DATASET"
 
-
-
+# 4. LangSmith 데이터셋 생성 or 불러오기
 def create_dataset(client, dataset_name, description=None):
-    for dataset in client.list_datasets():
-        if dataset.name == dataset_name:
-            return dataset
-
-    dataset = client.create_dataset(
-        dataset_name=dataset_name,
-        description=description,
-    )
-    return dataset
-
+    for ds in client.list_datasets():
+        if ds.name == dataset_name:
+            print(f"📦 기존 데이터셋 '{dataset_name}' 불러옴")
+            return ds
+    print(f"🆕 새로운 데이터셋 '{dataset_name}' 생성")
+    return client.create_dataset(dataset_name=dataset_name, description=description)
 
 dataset = create_dataset(client, dataset_name)
 
+# 5. LangSmith에 예제 업로드
+inputs = [{"question": q} for q in huggingface_df["question"]]
+outputs = [{"answer": a} for a in huggingface_df["ground_truth"]]
+
+
+client.create_examples(
+    inputs=inputs,
+    outputs=outputs,
+    dataset_id=dataset.id,
+)
+
+print("✅ LangSmith 데이터셋 업로드 완료")
