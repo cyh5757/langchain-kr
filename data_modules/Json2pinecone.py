@@ -1,104 +1,82 @@
 import os
-import json
-import uuid
-import concurrent.futures
-from typing import List, Any
-
-import pandas as pd
-from tqdm import tqdm
 from dotenv import load_dotenv
-from langchain.docstore.document import Document
+from langchain_community.document_loaders import JSONLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings
-from pinecone import Pinecone, ServerlessSpec
 from langchain_teddynote import logging
+from langchain_teddynote.community.pinecone import (
+    create_index,
+    upsert_documents_parallel_dense_only,
+)
 
-# LangSmith 추적 설정
+# ✅ 사용자 정의 preprocess_documents 함수 수정본 (None → 빈 문자열)
+def preprocess_documents(split_docs, metadata_keys=["source", "page"], min_length=2, use_basename=False):
+    contents = []
+    metadatas = {key: [] for key in metadata_keys}
+    for doc in split_docs:
+        content = doc.page_content.strip()
+        if content and len(content) >= min_length:
+            contents.append(content)
+            for k in metadata_keys:
+                value = doc.metadata.get(k, "")
+                if value is None:
+                    value = ""
+                if k == "source" and use_basename:
+                    value = os.path.basename(value)
+                try:
+                    metadatas[k].append(int(value))
+                except (ValueError, TypeError):
+                    metadatas[k].append(str(value))
+    return contents, metadatas
+
+# 1. 환경 변수 로드
+load_dotenv()
 logging.langsmith("Json2pinecone")
 
-# 1. 환경변수 로드
-load_dotenv()
+# 2. JSON 문서 로딩
+json_file = "Snack_data/snack_vector.json"
+text_splitter = RecursiveCharacterTextSplitter(chunk_size=300, chunk_overlap=50)
 
-PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
-PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "snack-db")
-PINECONE_REGION = os.getenv("PINECONE_REGION", "us-east-1")
-NAMESPACE = "snack-rag-namespace"
+def metadata_fn(sample, default_metadata):
+    return sample.get("metadata", {})
 
-# 환경 변수 확인
-if not PINECONE_API_KEY:
-    raise ValueError("❌ 환경변수 'PINECONE_API_KEY'가 설정되지 않았습니다.")
+loader = JSONLoader(
+    file_path=json_file,
+    jq_schema=".[]",
+    content_key="text",
+    text_content=False,
+    metadata_func=metadata_fn
+)
+split_docs = loader.load_and_split(text_splitter)
 
-# 2. JSON 데이터를 LangChain Document 객체로 변환
-def load_documents(filepath="Snack_data/snack_data.json") -> List[Document]:
-    with open(filepath, "r", encoding="utf-8") as f:
-        data = json.load(f)
+# 3. 전처리
+contents, metadatas = preprocess_documents(
+    split_docs=split_docs,
+    metadata_keys=["snack_name", "category", "company"],
+    min_length=5,
+    use_basename=False,
+)
 
-    documents = [
-        Document(
-            page_content=doc["page_content"],
-            metadata=doc["metadata"]
-        )
-        for doc in data
-    ]
-    return documents
+# 4. Pinecone 인덱스 생성
+pc_index = create_index(
+    api_key=os.environ["PINECONE_API_KEY"],
+    index_name=os.getenv("PINECONE_INDEX_NAME", "snack-db"),
+    dimension=3072,
+    metric="dotproduct",
+)
 
-# 3. Pinecone 인덱스 가져오기 또는 생성 (최초 1회만 삭제)
-def get_index(delete_first=False):
-    pc = Pinecone(api_key=PINECONE_API_KEY)
+# 5. Embedding
+openai_embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
 
+# 6. 업서트 실행
+upsert_documents_parallel_dense_only(
+    index=pc_index,
+    namespace="snack-rag-namespace",
+    contents=contents,
+    metadatas=metadatas,
+    embedder=openai_embeddings,
+    batch_size=8, #TPM에 맞춰서 알아서
+    max_workers=30,
+)
 
-    if PINECONE_INDEX_NAME not in pc.list_indexes().names():
-        print(f"📌 인덱스 '{PINECONE_INDEX_NAME}' 생성 중...")
-        pc.create_index(
-            name=PINECONE_INDEX_NAME,
-            dimension=3072,  # text-embedding-3-large 모델의 출력 차원
-            metric="dotproduct",
-            spec=ServerlessSpec(cloud="aws", region=PINECONE_REGION)
-        )
-        print(f"✅ 인덱스 생성 완료: {PINECONE_INDEX_NAME}")
-
-    return pc.Index(PINECONE_INDEX_NAME)
-
-# 4. 문서 벡터 임베딩 및 Pinecone 업로드
-def process_batch(batch: List[Document], embeddings: OpenAIEmbeddings, index: Any):
-    texts = [doc.page_content for doc in batch]
-    metadatas = [doc.metadata for doc in batch]
-    vectors = embeddings.embed_documents(texts)
-
-    index.upsert(
-        vectors=[
-            (str(uuid.uuid4()), vector, metadata)
-            for vector, metadata in zip(vectors, metadatas)
-        ],
-        namespace=NAMESPACE
-    )
-
-# 5. 메인 실행 로직
-if __name__ == "__main__":
-    print("🚀 과자 정보 벡터 저장 프로세스 시작...")
-
-    try:
-        print("📄 문서 로드 중...")
-        documents = load_documents()
-
-        print("📌 Pinecone 인덱스 준비 중...")
-        index = get_index(delete_first=False)  # 필요시 True로 변경
-
-        print("🔗 OpenAI 임베딩 모델 초기화 중...")
-        embeddings = OpenAIEmbeddings(model="text-embedding-3-large")  # 3072차원 출력
-
-        BATCH_SIZE = 64
-        batches = [documents[i:i + BATCH_SIZE] for i in range(0, len(documents), BATCH_SIZE)]
-
-        print("🚀 벡터 업로드 중...")
-        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-            futures = [
-                executor.submit(process_batch, batch, embeddings, index)
-                for batch in batches
-            ]
-            for _ in tqdm(concurrent.futures.as_completed(futures), total=len(futures)):
-                pass
-
-        print("✅ 전체 벡터 저장 완료: Pinecone 업로드 성공")
-
-    except Exception as e:
-        print(f"❌ 오류 발생: {e}")
+print("✅ Pinecone 하이브리드 업로드 완료")
